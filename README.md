@@ -29,7 +29,37 @@ NCSM's versatile design makes it suitable for a wide range of applications, incl
 - Scikit-learn
 
 ## Usage
-Refer to the `examples` directory for detailed examples on how to apply NCSM to your link prediction tasks. Basic usage involves initializing the model with your dataset and training parameters, then training the model on your graph data.
+
+Run the training script on a single dataset with:
+
+```bash
+python ncsm.py --dataset DATASET_NAME [--use-node-feats]
+```
+
+Replace `DATASET_NAME` with one of `Cora`, `Citeseer`, `PubMed`, `ogbl-ppa` or `ogbl-citation2`.
+Datasets are downloaded into the `dataset` folder beside the script (e.g. `D:\seinkim\NCSM\dataset` on Windows).
+Specify a different location with `--dataset-dir PATH` if desired.
+Pass `--use-node-feats` to train with the original node attributes; omit it to use learnable node embeddings only.
+
+Example commands for all five datasets:
+
+```bash
+# With node features
+python ncsm.py --dataset Cora --use-node-feats
+python ncsm.py --dataset Citeseer --use-node-feats
+python ncsm.py --dataset PubMed --use-node-feats
+python ncsm.py --dataset ogbl-ppa --use-node-feats
+python ncsm.py --dataset ogbl-citation2 --use-node-feats
+
+# Without node features
+python ncsm.py --dataset Cora
+python ncsm.py --dataset Citeseer
+python ncsm.py --dataset PubMed
+python ncsm.py --dataset ogbl-ppa
+python ncsm.py --dataset ogbl-citation2
+```
+
+The script reports AUC, AP, MRR and Hits@100 every few epochs.
 
 ## Contributing
 We welcome contributions to the NCSM project. If you have suggestions or improvements, please fork the repository and submit a pull request.
