@@ -37,6 +37,8 @@ python ncsm.py --dataset DATASET_NAME [--use-node-feats]
 ```
 
 Replace `DATASET_NAME` with one of `Cora`, `Citeseer`, `PubMed`, `ogbl-ppa` or `ogbl-citation2`.
+Datasets are downloaded into the `dataset` folder beside the script (e.g. `D:\seinkim\NCSM\dataset` on Windows).
+Specify a different location with `--dataset-dir PATH` if desired.
 Pass `--use-node-feats` to train with the original node attributes; omit it to use learnable node embeddings only.
 
 Example commands for all five datasets:

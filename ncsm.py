@@ -1,4 +1,5 @@
 import argparse
+import os
 import random
 import numpy as np
 import networkx as nx
@@ -341,16 +342,17 @@ def get_hc_features(G, samples_edges, centrality_type, similarity_type):
     return feats
 
 
-def load_dataset(name, device):
+def load_dataset(name, device, dataset_dir):
     """Load dataset and prepare train/valid/test splits."""
     if name in ['ogbl-ppa', 'ogbl-citation2']:
-        dataset = PygLinkPropPredDataset(name=name)
+        dataset = PygLinkPropPredDataset(name=name, root=dataset_dir)
         split_edge = dataset.get_edge_split()
         data = dataset[0]
         edge_index = split_edge['train']['edge'].t().to(device)
         data.edge_index = edge_index
     elif name in ['Cora', 'Citeseer', 'PubMed']:
-        dataset = Planetoid(root=f'/tmp/{name}', name=name)
+        root = os.path.join(dataset_dir, name)
+        dataset = Planetoid(root=root, name=name)
         data = dataset[0]
         transform = RandomLinkSplit(num_val=0.1, num_test=0.2, is_undirected=True,
                                     split_labels=True)
@@ -384,6 +386,9 @@ def main():
     parser.add_argument('--similarity', type=str, default='JA')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--runs', type=int, default=1)
+    parser.add_argument('--dataset-dir', type=str,
+                        default=os.path.join(os.path.dirname(__file__), 'dataset'),
+                        help='Directory to store datasets')
     parser.add_argument('--use-node-feats', action='store_true',
                         help='Use original node features instead of learnable embeddings')
     args = parser.parse_args()
@@ -399,7 +404,8 @@ def main():
     eval_steps = 5
     num_samples = 1
 
-    data, nx_graph, edges_reshaped, split_edge = load_dataset(args.dataset, device)
+    os.makedirs(args.dataset_dir, exist_ok=True)
+    data, nx_graph, edges_reshaped, split_edge = load_dataset(args.dataset, device, args.dataset_dir)
     feat_train = np.array(get_hc_features(nx_graph, edges_reshaped, args.centrality, args.similarity))
     alpha = 0.5
     edge_attr = feat_train[:, 0] * alpha + feat_train[:, 1] * alpha
