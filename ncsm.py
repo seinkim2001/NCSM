@@ -2,7 +2,6 @@ import argparse
 import random
 import numpy as np
 import networkx as nx
-import pandas as pd
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +14,7 @@ from torch_geometric.typing import OptPairTensor, Adj, OptTensor, Size
 from torch_geometric.nn.conv import MessagePassing
 from sklearn.metrics import roc_auc_score, average_precision_score
 from torch_geometric.datasets import Planetoid
+from torch_geometric.transforms import RandomLinkSplit
 
 from ogb.linkproppred import PygLinkPropPredDataset, Evaluator
 
@@ -226,7 +226,6 @@ def train(model, predictor, edge_attr, x, emb_ea, adj_t, split_edge, optimizer, 
         loss = pos_loss + neg_loss
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(x, 1.0)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
 
@@ -237,6 +236,22 @@ def train(model, predictor, edge_attr, x, emb_ea, adj_t, split_edge, optimizer, 
         total_examples += num_examples
 
     return total_loss / total_examples
+
+
+def _rank_metrics(pos_pred: torch.Tensor, neg_pred: torch.Tensor, k: int = 100):
+    """Compute AUC, AP, MRR and Hits@K without OGB evaluator."""
+    preds = torch.cat([pos_pred, neg_pred])
+    labels = torch.cat([torch.ones_like(pos_pred), torch.zeros_like(neg_pred)])
+    auc = roc_auc_score(labels.cpu(), preds.cpu())
+    ap = average_precision_score(labels.cpu(), preds.cpu())
+
+    # ranking metrics
+    neg_pred = neg_pred.view(1, -1)
+    pos_pred = pos_pred.view(-1, 1)
+    ranks = (neg_pred >= pos_pred).sum(dim=1) + 1
+    mrr = (1.0 / ranks.float()).mean().item()
+    hits = (ranks <= k).float().mean().item()
+    return auc, ap, mrr, hits
 
 
 def test(model, predictor, edge_attr, x, emb_ea, adj_t, split_edge, evaluator, batch_size):
@@ -250,56 +265,34 @@ def test(model, predictor, edge_attr, x, emb_ea, adj_t, split_edge, evaluator, b
     pos_test_edge = split_edge['test']['edge'].to(x.device)
     neg_test_edge = split_edge['test']['edge_neg'].to(x.device)
 
-    pos_valid_preds = []
-    for perm in DataLoader(range(pos_valid_edge.size(0)), batch_size):
-        edge = pos_valid_edge[perm].t()
-        pos_valid_preds += [predictor(h[edge[0]], h[edge[1]]).squeeze().cpu()]
-    pos_valid_pred = torch.cat(pos_valid_preds, dim=0)
+    def pred_edges(edge_index):
+        preds = []
+        for perm in DataLoader(range(edge_index.size(0)), batch_size):
+            edge = edge_index[perm].t()
+            preds += [predictor(h[edge[0]], h[edge[1]]).squeeze().cpu()]
+        return torch.cat(preds, dim=0)
 
-    neg_valid_preds = []
-    for perm in DataLoader(range(neg_valid_edge.size(0)), batch_size):
-        edge = neg_valid_edge[perm].t()
-        neg_valid_preds += [predictor(h[edge[0]], h[edge[1]]).squeeze().cpu()]
-    neg_valid_pred = torch.cat(neg_valid_preds, dim=0)
-
-    pos_test_preds = []
-    for perm in DataLoader(range(pos_test_edge.size(0)), batch_size):
-        edge = pos_test_edge[perm].t()
-        pos_test_preds += [predictor(h[edge[0]], h[edge[1]]).squeeze().cpu()]
-    pos_test_pred = torch.cat(pos_test_preds, dim=0)
-
-    neg_test_preds = []
-    for perm in DataLoader(range(neg_test_edge.size(0)), batch_size):
-        edge = neg_test_edge[perm].t()
-        neg_test_preds += [predictor(h[edge[0]], h[edge[1]]).squeeze().cpu()]
-    neg_test_pred = torch.cat(neg_test_preds, dim=0)
-
-    total_preds = torch.cat((pos_test_pred, neg_test_pred), dim=0)
-    labels = torch.cat((torch.ones_like(pos_test_pred), torch.zeros_like(neg_test_pred)), dim=0)
-    auc = roc_auc_score(labels.cpu(), torch.round(total_preds.cpu()))
-    ap_score = average_precision_score(labels.cpu(), torch.round(total_preds.cpu()))
+    pos_valid_pred = pred_edges(pos_valid_edge)
+    neg_valid_pred = pred_edges(neg_valid_edge)
+    pos_test_pred = pred_edges(pos_test_edge)
+    neg_test_pred = pred_edges(neg_test_edge)
 
     results = {}
+    for split, pos, neg in [('valid', pos_valid_pred, neg_valid_pred),
+                            ('test', pos_test_pred, neg_test_pred)]:
+        if evaluator is not None:
+            evaluator.K = 100
+            eval_res = evaluator.eval({'y_pred_pos': pos, 'y_pred_neg': neg})
+            mrr = eval_res.get('mrr', float('nan'))
+            hits = eval_res.get('hits@100', float('nan'))
+            auc = roc_auc_score(torch.cat([torch.ones_like(pos), torch.zeros_like(neg)]).cpu(),
+                                torch.cat([pos, neg]).cpu())
+            ap = average_precision_score(torch.cat([torch.ones_like(pos), torch.zeros_like(neg)]).cpu(),
+                                         torch.cat([pos, neg]).cpu())
+        else:
+            auc, ap, mrr, hits = _rank_metrics(pos, neg, k=100)
+        results[split] = {'AUC': auc, 'AP': ap, 'MRR': mrr, 'Hits@100': hits}
 
-    for K in [20]:
-        evaluator.K = K
-        train_hits = evaluator.eval({
-            'y_pred_pos': pos_valid_pred,
-            'y_pred_neg': neg_valid_pred,
-        })[f'hits@{K}']
-        valid_hits = evaluator.eval({
-            'y_pred_pos': pos_valid_pred,
-            'y_pred_neg': neg_valid_pred,
-        })[f'hits@{K}']
-        test_hits = evaluator.eval({
-            'y_pred_pos': pos_test_pred,
-            'y_pred_neg': neg_test_pred,
-        })[f'hits@{K}']
-
-        auc_results = {'AUC': auc}[f'AUC']
-        ap_results = {'AP': ap_score}[f'AP']
-
-        results[f'Hits@{K}'] = (train_hits, valid_hits, test_hits, auc_results, ap_results)
     return results
 
 
@@ -349,37 +342,50 @@ def get_hc_features(G, samples_edges, centrality_type, similarity_type):
 
 
 def load_dataset(name, device):
-    split_edge = None
-
-    if name in ['ogbl-ddi']:
+    """Load dataset and prepare train/valid/test splits."""
+    if name in ['ogbl-ppa', 'ogbl-citation2']:
         dataset = PygLinkPropPredDataset(name=name)
         split_edge = dataset.get_edge_split()
-    elif name == 'Cora':
-        dataset = Planetoid(root='/tmp/Cora', name='Cora')
-    elif name == 'CiteSeer':
-        dataset = Planetoid(root='/tmp/CiteSeer', name='CiteSeer')
-    elif name == 'PubMed':
-        dataset = Planetoid(root='/tmp/PubMed', name='PubMed')
+        data = dataset[0]
+        edge_index = split_edge['train']['edge'].t().to(device)
+        data.edge_index = edge_index
+    elif name in ['Cora', 'Citeseer', 'PubMed']:
+        dataset = Planetoid(root=f'/tmp/{name}', name=name)
+        data = dataset[0]
+        transform = RandomLinkSplit(num_val=0.1, num_test=0.2, is_undirected=True,
+                                    split_labels=True)
+        train_data, val_data, test_data = transform(data)
+        edge_index = train_data.edge_index.to(device)
+        split_edge = {
+            'train': {'edge': train_data.edge_index.t()},
+            'valid': {
+                'edge': val_data.edge_label_index[:, val_data.edge_label == 1].t(),
+                'edge_neg': val_data.edge_label_index[:, val_data.edge_label == 0].t(),
+            },
+            'test': {
+                'edge': test_data.edge_label_index[:, test_data.edge_label == 1].t(),
+                'edge_neg': test_data.edge_label_index[:, test_data.edge_label == 0].t(),
+            },
+        }
+        data.edge_index = edge_index
     else:
-        raise ValueError("Dataset not supported")
+        raise ValueError('Dataset not supported')
 
-    data = dataset[0]
-    edge_index = data.edge_index.to(device)
     nx_graph = to_networkx(data, to_undirected=True)
-
-    edgenp = edge_index.cpu().numpy()
+    edgenp = data.edge_index.cpu().numpy()
     edges_reshaped = np.reshape(edgenp, (-1, 2), order='F')
-
     return data, nx_graph, edges_reshaped, split_edge
 
 
 def main():
     parser = argparse.ArgumentParser(description='NCSM Link Prediction')
-    parser.add_argument('--dataset', type=str, default='ogbl-ddi')
+    parser.add_argument('--dataset', type=str, default='Cora')
     parser.add_argument('--centrality', type=str, default='BC')
     parser.add_argument('--similarity', type=str, default='JA')
-    parser.add_argument('--epochs', type=int, default=400)
-    parser.add_argument('--runs', type=int, default=10)
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--runs', type=int, default=1)
+    parser.add_argument('--use-node-feats', action='store_true',
+                        help='Use original node features instead of learnable embeddings')
     args = parser.parse_args()
 
     set_seed(1)
@@ -392,13 +398,9 @@ def main():
     lr = 0.003
     eval_steps = 5
     num_samples = 1
-    node_emb = 256
 
     data, nx_graph, edges_reshaped, split_edge = load_dataset(args.dataset, device)
     feat_train = np.array(get_hc_features(nx_graph, edges_reshaped, args.centrality, args.similarity))
-    df_save = pd.DataFrame(feat_train, columns=['j_coefficient', 'u_centrality'])
-    df_save.to_csv('jaccard_degree.csv', index=False)
-
     alpha = 0.5
     edge_attr = feat_train[:, 0] * alpha + feat_train[:, 1] * alpha
     edge_attr = np.reshape(edge_attr, (edge_attr.size, 1))
@@ -407,58 +409,46 @@ def main():
     min_attr = torch.min(edge_attr)
     edge_attr = (edge_attr - min_attr) / (max_attr - min_attr + 1e-15)
     edge_index = data.edge_index.to(device)
-    model = GraphSAGE(node_emb, hidden_channels, hidden_channels, num_layers, dropout).to(device)
 
-    emb = torch.nn.Embedding(data.num_nodes, node_emb).to(device)
-    emb_ea = torch.nn.Embedding(num_samples, node_emb).to(device)
-    predictor = LinkPredictor(hidden_channels, hidden_channels, 1,
-                              num_layers + 1, dropout).to(device)
+    if args.use_node_feats and getattr(data, 'x', None) is not None:
+        x = data.x.to(device)
+        in_channels = x.size(-1)
+        node_params = []
+    else:
+        in_channels = 256
+        emb = torch.nn.Embedding(data.num_nodes, in_channels).to(device)
+        x = emb.weight
+        node_params = list(emb.parameters())
 
-    evaluator = Evaluator(name=args.dataset)
-    loggers = {'Hits@20': Logger(args.runs)}
+    model = GraphSAGE(in_channels, hidden_channels, hidden_channels, num_layers, dropout).to(device)
+    emb_ea = torch.nn.Embedding(num_samples, in_channels).to(device)
+    predictor = LinkPredictor(hidden_channels, hidden_channels, 1, num_layers + 1, dropout).to(device)
+
+    evaluator = Evaluator(name=args.dataset) if args.dataset.startswith('ogbl') else None
 
     for run in range(args.runs):
         random.seed(run)
         torch.manual_seed(run)
-        torch.nn.init.xavier_uniform_(emb.weight)
-        torch.nn.init.xavier_uniform_(emb_ea.weight)
         model.reset_parameters()
         predictor.reset_parameters()
+        torch.nn.init.xavier_uniform_(emb_ea.weight)
+        if not args.use_node_feats:
+            torch.nn.init.xavier_uniform_(emb.weight)
+
         optimizer = torch.optim.Adam(
-            list(model.parameters()) + list(emb.parameters()) +
-            list(emb_ea.parameters()) + list(predictor.parameters()), lr=lr)
+            list(model.parameters()) + node_params + list(emb_ea.parameters()) + list(predictor.parameters()), lr=lr)
 
         for epoch in range(1, 1 + args.epochs):
-            loss = train(model, predictor, edge_attr, emb.weight, emb_ea.weight, edge_index, split_edge,
-                          optimizer, batch_size)
+            loss = train(model, predictor, edge_attr, x, emb_ea.weight, edge_index, split_edge, optimizer, batch_size)
 
             if epoch % eval_steps == 0:
-                results = test(model, predictor, edge_attr, emb.weight, emb_ea.weight, edge_index, split_edge,
-                                evaluator, batch_size)
-                for key, result in results.items():
-                    loggers[key].add_result(run, result)
+                results = test(model, predictor, edge_attr, x, emb_ea.weight, edge_index, split_edge, evaluator, batch_size)
+                valid_res = results['valid']
+                test_res = results['test']
+                print(f"Run {run+1:02d} | Epoch {epoch:03d} | Loss {loss:.4f} | "
+                      f"Valid AUC {valid_res['AUC']:.4f} AP {valid_res['AP']:.4f} MRR {valid_res['MRR']:.4f} Hits@100 {valid_res['Hits@100']:.4f} | "
+                      f"Test AUC {test_res['AUC']:.4f} AP {test_res['AP']:.4f} MRR {test_res['MRR']:.4f} Hits@100 {test_res['Hits@100']:.4f}")
 
-                if epoch % log_steps == 0:
-                    for key, result in results.items():
-                        train_hits, valid_hits, test_hits, auc, ap_score = result
-                        print(key)
-                        print(f'Run: {run + 1:02d}, '
-                              f'Epoch: {epoch:02d}, '
-                              f'Loss: {loss:.4f}, '
-                              f'AUC: {100 * auc:.2f}%, '
-                              f'AP: {100 * ap_score:.2f}%, '
-                              f'Train: {100 * train_hits:.2f}%, '
-                              f'Valid: {100 * valid_hits:.2f}%, '
-                              f'Test: {100 * test_hits:.2f}%')
-                    print('---')
-
-        for key in loggers.keys():
-            print(key)
-            loggers[key].print_statistics(run)
-
-    for key in loggers.keys():
-        print(key)
-        loggers[key].print_statistics()
 
 
 if __name__ == '__main__':
